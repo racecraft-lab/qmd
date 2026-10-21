@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Security
+
+- Require certifi 2026.10.19 or newer in the Python fine-tuning environment and self-contained HuggingFace training and evaluation jobs to remove the affected emSign root certificate.
+- Use patched Node.js 22.23.4 and 24.22.1 in CI and publishing. Bun jobs still need a stable release containing the root-certificate update.
+
 ### Added
 
 - Added Oxlint lint fence.

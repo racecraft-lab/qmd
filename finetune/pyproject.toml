@@ -23,6 +23,9 @@ dependencies = [
 dev = []
 
 [tool.uv]
+# Preserve the historical cutoff; admit only the fixed certifi release window.
+exclude-newer = "2026-04-04T01:01:35Z"
+exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
 constraint-dependencies = [
   "certifi>=2026.10.19",
   "authlib>=1.6.9",

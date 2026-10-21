@@ -8,6 +8,12 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
+[options]
+exclude-newer = "2026-04-04T01:01:35Z"
+
+[options.exclude-newer-package]
+certifi = "2026-10-20T02:24:17Z"
+
 [manifest]
 constraints = [
     { name = "aiohttp", specifier = ">=3.13.4" },

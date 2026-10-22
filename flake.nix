@@ -36,7 +36,23 @@
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
         version = packageJson.version;
 
-        nodejs = pkgs.nodejs.overrideAttrs (finalAttrs: previousAttrs: {
+        # Node 24.22.1 requires libuv 1.52.0 or later.
+        nodeLibuv = pkgs.libuv.overrideAttrs (finalAttrs: _previousAttrs: {
+          version = "1.52.1";
+          src = pkgs.fetchFromGitHub {
+            owner = "libuv";
+            repo = "libuv";
+            rev = "v${finalAttrs.version}";
+            hash = "sha256-Y9Nph2LkT1qnOYTW3WCumWWwORnI4P7HxzBjUlGaL7M=";
+          };
+        });
+        nodeUvwasi = pkgs.uvwasi.override { libuv = nodeLibuv; };
+        nodejs = (pkgs.nodejs.override (previousArgs: {
+          callPackage = path: args: previousArgs.callPackage path (args // {
+            libuv = nodeLibuv;
+            uvwasi = nodeUvwasi;
+          });
+        })).overrideAttrs (finalAttrs: previousAttrs: {
           version = "24.22.1";
           # This emulator support is already included in Node 24.22.1.
           patches =

@@ -47,8 +47,17 @@
           };
         });
         nodeUvwasi = pkgs.uvwasi.override { libuv = nodeLibuv; };
+        nodeBrotli = pkgs.brotli.overrideAttrs (_finalAttrs: previousAttrs: {
+          patches = previousAttrs.patches ++ [
+            (pkgs.fetchurl {
+              url = "https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b.patch";
+              hash = "sha256-gzyh1x7thb3jwhxjpu4xATh3Qbiqi5qCJRNAlKZ3thk=";
+            })
+          ];
+        });
         nodejs = (pkgs.nodejs.override (previousArgs: {
           callPackage = path: args: previousArgs.callPackage path (args // {
+            brotli = nodeBrotli;
             libuv = nodeLibuv;
             uvwasi = nodeUvwasi;
           });

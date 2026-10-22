@@ -545,7 +545,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 ### System Requirements
 
 - **Node.js** >= 22
-- **Bun** >= 1.0.0
+- **Bun** >= 1.4.4
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
   brew install sqlite

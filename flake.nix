@@ -36,6 +36,50 @@
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
         version = packageJson.version;
 
+        nodejs = pkgs.nodejs.overrideAttrs (finalAttrs: previousAttrs: {
+          version = "24.22.1";
+          # This emulator support is already included in Node 24.22.1.
+          patches =
+            let
+              kept = pkgs.lib.remove
+                (pkgs.path + "/pkgs/development/web/nodejs/configure-emulator.patch")
+                previousAttrs.patches;
+            in
+            assert builtins.length kept + 1 == builtins.length previousAttrs.patches;
+            kept;
+          src = pkgs.fetchurl {
+            url = "https://nodejs.org/dist/v${finalAttrs.version}/node-v${finalAttrs.version}.tar.xz";
+            hash = "sha256-T1N5eWKAza6wwvNY/QS2oWzE+336g7WoyRqdljtDUjE=";
+          };
+        });
+        nodeGyp = pkgs.node-gyp.override { inherit nodejs; };
+
+        # Keep the locked package set; update only Bun and its verified release sources.
+        bun = pkgs.bun.overrideAttrs (finalAttrs: previousAttrs: {
+          version = "1.4.4";
+          src = finalAttrs.passthru.sources.${system};
+          passthru = previousAttrs.passthru // {
+            sources = {
+              "aarch64-darwin" = pkgs.fetchurl {
+                url = "https://github.com/oven-sh/bun/releases/download/bun-v${finalAttrs.version}/bun-darwin-aarch64.zip";
+                hash = "sha256-wkDX8My5DCY6hJ/NsJt+5iYw2SE0jtaq/ahrnVd7xRA=";
+              };
+              "aarch64-linux" = pkgs.fetchurl {
+                url = "https://github.com/oven-sh/bun/releases/download/bun-v${finalAttrs.version}/bun-linux-aarch64.zip";
+                hash = "sha256-uqa7NvUdblhWHgK76oJQOKnfRU9nPW13bou/hvjHhQ4=";
+              };
+              "x86_64-darwin" = pkgs.fetchurl {
+                url = "https://github.com/oven-sh/bun/releases/download/bun-v${finalAttrs.version}/bun-darwin-x64-baseline.zip";
+                hash = "sha256-1KFVrfv9CRVes7oFyeOlRPOSl9emhhbTx3WfZ6tcR9w=";
+              };
+              "x86_64-linux" = pkgs.fetchurl {
+                url = "https://github.com/oven-sh/bun/releases/download/bun-v${finalAttrs.version}/bun-linux-x64.zip";
+                hash = "sha256-v4zL+ysLgBWeD5ptFcVTF63YB3U028YTCj7bUvzLOVw=";
+              };
+            };
+          };
+        });
+
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
           configureFlags = (old.configureFlags or []) ++ [
@@ -64,7 +108,7 @@
           ];
 
           nativeBuildInputs = [
-            pkgs.bun
+            bun
           ];
 
           dontConfigure = true;
@@ -99,10 +143,10 @@
           src = ./.;
 
           nativeBuildInputs = [
-            pkgs.bun
+            bun
             pkgs.makeWrapper
-            pkgs.nodejs
-            pkgs.node-gyp
+            nodejs
+            nodeGyp
             pkgs.python3  # needed by node-gyp to compile better-sqlite3
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
@@ -136,7 +180,7 @@
             # (ggml-org/llama.cpp#22593). `--run` fires before bun starts, so
             # the env is in place before the native binding loads. Preserve
             # explicit user values; QMD_METAL_KEEP_RESIDENCY=1 opts back in.
-            makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
+            makeWrapper ${bun}/bin/bun $out/bin/qmd \
               --add-flags "$out/lib/qmd/src/cli/qmd.ts" \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
               --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc.libc.out}/lib:${pkgs.stdenv.cc.cc.lib}/lib"}" \
@@ -164,7 +208,7 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            pkgs.bun
+            bun
             sqliteWithExtensions
           ];
 

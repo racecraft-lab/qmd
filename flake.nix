@@ -55,12 +55,45 @@
             })
           ];
         });
+        # Match the nghttp2 release bundled with Node 24.22.1.
+        nodeNghttp2 = pkgs.nghttp2.overrideAttrs (finalAttrs: _previousAttrs: {
+          version = "1.70.0";
+          src = pkgs.fetchurl {
+            url = "https://github.com/nghttp2/nghttp2/releases/download/v${finalAttrs.version}/nghttp2-${finalAttrs.version}.tar.bz2";
+            hash = "sha256-j6yh94qpmsO8F2ina34PazbY5qYsE4GHUbHSBfAvlAU=";
+          };
+        });
+        nghttp2RevertSink = {
+          overrideAttrs = modifier:
+            assert builtins.isAttrs modifier;
+            assert builtins.attrNames modifier == [ "patches" ];
+            assert builtins.isList modifier.patches;
+            assert builtins.length modifier.patches == 1;
+            let patch = builtins.head modifier.patches; in
+            assert builtins.isAttrs patch;
+            assert pkgs.lib.isDerivation patch;
+            assert patch.outputHash == "sha256-RG87Qifjpl7HTP9ac2JwHj2XAbDlFgOpAnpZX3ET6gU=";
+            assert (patch.outputHashAlgo or null) == null;
+            assert patch.url == "https://github.com/nghttp2/nghttp2/commit/7784fa979d0bcf801a35f1afbb25fb048d815cd7.patch?full_index=1";
+            assert patch.urls == [ "https://github.com/nghttp2/nghttp2/commit/7784fa979d0bcf801a35f1afbb25fb048d815cd7.patch?full_index=1" ];
+            assert patch.drvPath == (pkgs.fetchpatch2 {
+              url = "https://github.com/nghttp2/nghttp2/commit/7784fa979d0bcf801a35f1afbb25fb048d815cd7.patch?full_index=1";
+              hash = "sha256-RG87Qifjpl7HTP9ac2JwHj2XAbDlFgOpAnpZX3ET6gU=";
+              revert = true;
+              excludes = [ "lib/includes/nghttp2/nghttp2.h" ];
+            }).drvPath;
+            assert pkgs.nghttp2.version == "1.67.1";
+            assert (pkgs.nghttp2.patches or [ ]) == [ ];
+            nodeNghttp2;
+        };
         nodejs = (pkgs.nodejs.override (previousArgs: {
           callPackage = path: args: previousArgs.callPackage path (args // {
             brotli = nodeBrotli;
             libuv = nodeLibuv;
             uvwasi = nodeUvwasi;
-          });
+          } // pkgs.lib.optionalAttrs
+            (path == pkgs.path + "/pkgs/development/web/nodejs/nodejs.nix")
+            { nghttp2 = nghttp2RevertSink; });
         })).overrideAttrs (finalAttrs: previousAttrs: {
           version = "24.22.1";
           # This emulator support is already included in Node 24.22.1.

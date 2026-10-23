@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     "certifi>=2026.10.19",
 #     "trl>=0.12.0",
 #     "peft>=0.7.0",
 #     "transformers>=4.45.0",

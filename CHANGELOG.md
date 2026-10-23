@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Security
+
+- Use Node.js 24.22.1 for Nix native builds and node-gyp local headers without changing the locked package set.
+- Require certifi 2026.10.19 or newer in the synced Python project environment and the standalone `finetune/jobs/sft.py` and `finetune/jobs/eval.py` jobs to remove the affected emSign root certificate.
+- Use patched Node.js 22.23.4 and 24.22.1 in CI and publishing. Select stable Bun 1.4.4 in CI, publishing, container smoke tests and Nix, and require Bun 1.4.4 or newer.
+
 ### Added
 
 - Added Oxlint lint fence.

@@ -206,7 +206,7 @@ run_npx_scenario() {
 
 run_bun_scenario() {
   local NODE_BIN='$(mise where node@latest)/bin'
-  local BUN_BIN='$(mise where bun@latest)/bin'
+  local BUN_BIN='$(mise where bun@1.4.4)/bin'
   local bin='$HOME/.bun/bin/qmd'
   echo "=== Bun: bun install -g packed tarball ==="
   run_runtime_matrix "bun" "$bin" "export PATH=$BUN_BIN:$NODE_BIN:\$PATH"

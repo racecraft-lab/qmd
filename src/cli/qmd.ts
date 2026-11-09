@@ -28,6 +28,7 @@ import {
   resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
+  getEmbeddingVectorSamples,
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
@@ -56,9 +57,12 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
+  cleanupOrphanedVectors,
+  copyVectorsToNewCollections,
   countOrphanedVectors,
   previewCleanup,
   runCleanup,
+  type VectorTableLayout,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
@@ -80,12 +84,29 @@ import {
   createStore,
   getDefaultDbPath,
   reindexCollection,
+  scanWriteBatch,
+  REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
+import {
+  syncDocumentMetadata,
+  countDocumentsPendingMetadata,
+  countDocumentsWithMetadata,
+  countMetadataKeys,
+  listMetadata,
+  listMetadataCollectionSummaries,
+  MetadataBindingBudgetError,
+  type ListMetadataOptions,
+  type ListMetadataResult,
+} from "../metadata-store.js";
+import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-format.js";
+import type { DocumentMetadata } from "../metadata.js";
+import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
+import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -219,11 +240,16 @@ function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string 
 
 function setIndexName(name: string | null): void {
   let normalizedName = name;
-  // Normalize relative paths to prevent malformed database paths
-  if (name && name.includes('/')) {
-    const absolutePath = pathResolve(process.cwd(), name);
-    // Replace path separators with underscores to create a valid filename
-    normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
+  // Normalize relative paths to prevent malformed database paths. Windows
+  // absolute paths (C:\..., \\server\share) are already absolute -- skip
+  // pathResolve() for those and sanitize `:` and `\` alongside `/`.
+  if (name) {
+    const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || /^\\/.test(name);
+    if (isWindowsAbsolute || /[\\/]/.test(name)) {
+      const absolutePath = isWindowsAbsolute ? name : pathResolve(process.cwd(), name);
+      // Replace path separators with underscores to create a valid filename
+      normalizedName = absolutePath.replace(/[:\\/]+/g, '_').replace(/^_+/, '');
+    }
   }
   currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
@@ -503,14 +529,6 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
-/** Hint after `qmd update` when orphaned embedding chunks exceed this share of vectors (#768). */
-const ORPHAN_VECTOR_HINT_RATIO = 0.1;
-
-function formatOrphanedVectorHint(orphaned: number, total: number): string {
-  const pct = total > 0 ? Math.round((orphaned / total) * 100) : 0;
-  return `${orphaned} orphaned embedding chunks (${pct}% of vectors) — run 'qmd cleanup' to reclaim space`;
-}
-
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -565,6 +583,14 @@ async function showStatus(): Promise<void> {
   }
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
+  }
+  const metadataKeyCount = countMetadataKeys(db);
+  if (metadataKeyCount > 0) {
+    console.log(`  Metadata: ${metadataKeyCount} keys across ${countDocumentsWithMetadata(db)} files (explore with 'qmd collection metadata')`);
+  }
+  const pendingMetadata = countDocumentsPendingMetadata(db);
+  if (pendingMetadata > 0) {
+    console.log(`  ${c.yellow}Metadata: ${pendingMetadata} need extraction${c.reset} (run 'qmd update'; excluded from --filter searches)`);
   }
   if (mostRecent.latest) {
     const lastUpdate = new Date(mostRecent.latest);
@@ -985,24 +1011,38 @@ async function updateCollections(): Promise<void> {
     progress.clear();
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
     reportSkippedReads(result.skippedFiles);
+    reportMetadataErrors(result.metadataErrors);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
     }
     console.log("");
   }
 
+  // The pending count below only sees content_vectors, so a hash that joined
+  // a collection while already embedded elsewhere would be neither counted
+  // nor searchable there; copying its rows closes that gap without a model.
+  // The copy runs before the cleanup, which deletes the partition rows the
+  // copy reads from, so a document moved between collections keeps its vectors.
+  const copiedVectors = copyVectorsToNewCollections(db).copied;
+  // A changed file rewrites its document's hash in place, which strands the
+  // old hash's rows in the collection's vector partition; the partition
+  // filter cannot see documents.active, so those rows would take k slots
+  // from a scoped search until they are removed.
+  const staleVectors = cleanupOrphanedVectors(db);
+
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
-  const orphanedVectors = countOrphanedVectors(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (staleVectors > 0) {
+    console.log(`Removed ${staleVectors} stale vector row(s)`);
+  }
+  if (copiedVectors > 0) {
+    console.log(`Copied ${copiedVectors} vector(s) into collections that gained already-embedded documents`);
+  }
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
-  }
-  if (vectorTotal > 0 && orphanedVectors / vectorTotal >= ORPHAN_VECTOR_HINT_RATIO) {
-    console.log(`\n${formatOrphanedVectorHint(orphanedVectors, vectorTotal)}`);
   }
 }
 
@@ -1782,6 +1822,7 @@ function collectionList(): void {
   }
 
   console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
+  const metadataOverviews = listMetadataCollectionSummaries(db, COLLECTION_LIST_METADATA_KEYS);
 
   for (const coll of collections) {
     const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
@@ -1798,11 +1839,37 @@ function collectionList(): void {
       console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
     }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
+    const metadataOverview = metadataOverviews.get(coll.name);
+    if (metadataOverview) {
+      const shownKeys = metadataOverview.keys.map(overview => overview.key);
+      const hiddenKeys = metadataOverview.totalKeys - shownKeys.length;
+      console.log(`  ${c.dim}Metadata:${c.reset} ${shownKeys.join(', ')}${hiddenKeys > 0 ? `, +${hiddenKeys} more` : ''}`);
+    }
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
     console.log();
   }
 
   closeDb();
+}
+
+/** Key names shown on `collection list`, and keys detailed on `collection show`. */
+const COLLECTION_LIST_METADATA_KEYS = 5;
+
+// The Metadata section of `collection show`: top keys by coverage with a
+// value preview, and a pointer at the drill-down for the rest.
+function collectionShowMetadata(name: string): void {
+  const db = getDb();
+  const result = listMetadata(db, { collection: name, keyLimit: COLLECTION_LIST_METADATA_KEYS, valueLimit: 3 });
+  const documentsWithMetadata = countDocumentsWithMetadata(db, [name]);
+  const pendingMetadata = countDocumentsPendingMetadata(db, [name]);
+  closeDb();
+
+  console.log(formatMetadataOverview(result, {
+    documentsWithMetadata,
+    pendingMetadata,
+    drillDownHint: `qmd collection metadata ${name}`,
+    colors: c,
+  }));
 }
 
 /** Canonical --mask, with --glob as the alias OpenClaw and others already pass (#536). */
@@ -1903,6 +1970,128 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
+// Metadata discovery drill-down. Collection names are already validated;
+// an empty list means the default collections resolved to nothing, which
+// the store reads as "every collection" exactly as search does.
+function collectionMetadata(collectionNames: string[], options: ListMetadataOptions): void {
+  const db = getDb();
+
+  if (listCollections(db).length === 0) {
+    console.log("No collections found. Run 'qmd collection add .' to create one.");
+    closeDb();
+    return;
+  }
+
+  // Discovery always applies the extraction gate, filter or not.
+  warnPendingMetadata(db, collectionNames);
+
+  let result: ListMetadataResult;
+  try {
+    result = listMetadata(db, { ...options, collection: collectionSearchFilter(collectionNames) });
+  } catch (error) {
+    if (!(error instanceof MetadataBindingBudgetError)) throw error;
+    closeDb();
+    console.error(`${c.yellow}${error.message}${c.reset}`);
+    process.exit(1);
+  }
+  closeDb();
+
+  const selection = options.match || options.filter;
+  console.log(formatMetadataKeySummaries(result, {
+    showCollections: collectionNames.length !== 1,
+    valueWindowHint: "--value-limit <n>, --value-offset <n>, or --all-values",
+    keyWindowHint: "--key-limit <n>, --key-offset <n>, or --all-keys",
+    keyOffset: options.keyOffset ?? 0,
+    keyOffsetLabel: "--key-offset",
+    emptyMessage: selection
+      ? "No metadata matches. Run 'qmd collection metadata' without --match or --filter to see which keys exist."
+      : "No metadata found. Add qmd.metadata frontmatter and run 'qmd update'.",
+    colors: c,
+  }));
+}
+
+// Parse the discovery-specific flags; exits with usage on a bad value.
+function parseCliMetadataOptions(values: Record<string, unknown>): ListMetadataOptions {
+  const options: ListMetadataOptions = {
+    match: parseCliMetadataMatch(values.match),
+    filter: parseCliMetadataFilter(values.filter),
+  };
+
+  // Discovery windows two dimensions, so the single-window search flags
+  // have no reading here. Point at the flags that do.
+  if (values.n !== undefined) {
+    console.error("-n is not an option of 'qmd collection metadata'");
+    console.error("Use --value-limit <n> for values per key, or --key-limit <n> for keys");
+    process.exit(1);
+  }
+  if (values.all) {
+    console.error("--all is not an option of 'qmd collection metadata'");
+    console.error("Use --all-values, --all-keys, or both");
+    process.exit(1);
+  }
+
+  const formatAlias = ["json", "csv", "md", "xml", "files"].find(flag => values[flag]);
+  const format = typeof values.format === "string" ? values.format.trim().toLowerCase() : undefined;
+  if (formatAlias || (format !== undefined && format !== "cli")) {
+    console.error(`${formatAlias ? `--${formatAlias}` : `--format ${String(values.format)}`} is not supported by 'qmd collection metadata'`);
+    console.error("This command prints text. Use the SDK, MCP metadata tool, or POST /metadata for structured output");
+    process.exit(1);
+  }
+
+  if (values["all-keys"]) {
+    options.keyLimit = Infinity;
+  } else if (values["key-limit"] !== undefined) {
+    options.keyLimit = parsePositiveInteger(values["key-limit"], "--key-limit");
+  }
+  if (values["key-offset"] !== undefined) {
+    options.keyOffset = parseNonNegativeInteger(values["key-offset"], "--key-offset");
+  }
+
+  if (values["all-values"]) {
+    options.valueLimit = Infinity;
+  } else if (values["value-limit"] !== undefined) {
+    options.valueLimit = parsePositiveInteger(values["value-limit"], "--value-limit");
+  }
+  if (values["value-offset"] !== undefined) {
+    options.valueOffset = parseNonNegativeInteger(values["value-offset"], "--value-offset");
+  }
+
+  if (values["min-count"] !== undefined) {
+    options.minCount = parsePositiveInteger(values["min-count"], "--min-count");
+  }
+
+  if (values.sort !== undefined) {
+    if (values.sort !== "count" && values.sort !== "value") {
+      console.error(`Invalid --sort value: ${String(values.sort)}`);
+      console.error("Valid: count, value");
+      process.exit(1);
+    }
+    options.sort = values.sort;
+  }
+
+  return options;
+}
+
+function parsePositiveInteger(raw: unknown, flag: string): number {
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    console.error(`Invalid ${flag} value: ${String(raw)}`);
+    console.error(`${flag} must be a positive safe integer`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function parseNonNegativeInteger(raw: unknown, flag: string): number {
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    console.error(`Invalid ${flag} value: ${String(raw)}`);
+    console.error(`${flag} must be a non-negative safe integer`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
@@ -1945,7 +2134,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
   const skippedFiles: { file: string; code: string }[] = [];
   const seenPaths = new Set<string>();
   // Literal paths of every file in this scan. Passed to the legacy-path
@@ -1953,13 +2142,23 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
 
+  const batch = scanWriteBatch(db);
   for (const relativeFile of files) {
+    batch.next();
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     // Store the literal relative path — handelize() is NOT applied at index time.
     const path = relativeFile.replace(/\\/g, '/');
     if (!isPathInsideDir(resolvedPwd, filepath)) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      progress.set((processed / total) * 100);
+      continue;
+    }
+    let tooLarge = false;
+    try { tooLarge = statSync(filepath).size > REINDEX_MAX_FILE_SIZE; } catch { /* the read below reports it */ }
+    if (tooLarge) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
       progress.set((processed / total) * 100);
       continue;
     }
@@ -1988,8 +2187,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     // Check if document exists (also migrates legacy lowercase paths)
     const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
+    let documentId: number;
+    let contentChanged = true;
+
     if (existing) {
+      documentId = existing.id;
       if (existing.hash === hash) {
+        contentChanged = false;
         // Hash unchanged, but check if title needs updating
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
@@ -2010,10 +2214,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       indexed++;
       insertContent(db, hash, content, now);
       const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
+      documentId = insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
+
+    // Unchanged content still backfills missing or stale extraction state.
+    const extraction = syncDocumentMetadata(db, documentId, content, path,
+      contentChanged ? undefined : { onlyIfStale: true });
+    if (extraction?.error) metadataErrors++;
 
     processed++;
     progress.set((processed / total) * 100);
@@ -2029,13 +2238,17 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
+      batch.next();
       deactivateDocument(db, collectionName, path);
       removed++;
     }
   }
 
+  batch.commit();
+
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
+  const copiedVectors = copyVectorsToNewCollections(db, collectionName).copied;
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -2043,8 +2256,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
   reportSkippedReads(skippedFiles);
+  reportMetadataErrors(metadataErrors);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+  if (copiedVectors > 0) {
+    console.log(`Copied ${copiedVectors} vector(s) into collections that gained already-embedded documents`);
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
@@ -2062,18 +2279,31 @@ function fsErrorCode(err: unknown): string {
   return "ERROR";
 }
 
+function reportMetadataErrors(metadataErrors: number): void {
+  if (metadataErrors === 0) return;
+  console.warn(`⚠ ${metadataErrors} file(s) have invalid qmd.metadata frontmatter and are excluded from filtered search`);
+}
+
 function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
   if (skippedFiles.length === 0) return;
+  const sizeLimitMb = Math.round(REINDEX_MAX_FILE_SIZE / (1024 * 1024));
   for (const skipped of skippedFiles) {
-    if (skipped.code === "OUTSIDE_COLLECTION") {
+    if (skipped.code === "ROOT_MISSING") {
+      console.warn(`⚠ Collection root not found, index left unchanged: ${skipped.file}`);
+    } else if (skipped.code === "OUTSIDE_COLLECTION") {
       console.warn(`⚠ Skipped file outside collection: ${skipped.file}`);
+    } else if (skipped.code === "FILE_TOO_LARGE") {
+      console.warn(`⚠ Skipped file over ${sizeLimitMb} MB: ${skipped.file}`);
     } else {
       console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
     }
   }
   const escaped = skippedFiles.filter(f => f.code === "OUTSIDE_COLLECTION").length;
-  const unreadable = skippedFiles.length - escaped;
+  const tooLarge = skippedFiles.filter(f => f.code === "FILE_TOO_LARGE").length;
+  const rootMissing = skippedFiles.filter(f => f.code === "ROOT_MISSING").length;
+  const unreadable = skippedFiles.length - escaped - tooLarge - rootMissing;
   if (escaped) console.warn(`Skipped ${escaped} file(s) outside the collection root`);
+  if (tooLarge) console.warn(`Skipped ${tooLarge} file(s) over ${sizeLimitMb} MB`);
   if (unreadable) console.warn(`Skipped ${unreadable} unreadable file(s)`);
 }
 
@@ -2165,7 +2395,7 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
-  // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
+  // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
   if (!embedLock) {
     console.log(EMBED_LOCK_BUSY_MESSAGE);
@@ -2237,6 +2467,9 @@ async function vectorIndex(
 
     const totalTimeSec = result.durationMs / 1000;
 
+    if (result.chunksCopied > 0) {
+      console.log(`${c.green}✓${c.reset} Copied ${formatCount(result.chunksCopied)} vectors into collections that gained already-embedded documents`);
+    }
     if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
       console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
@@ -2316,6 +2549,7 @@ type OutputOptions = {
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
+  filter?: MetadataFilter;  // Metadata filter (--filter JSON)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2390,6 +2624,7 @@ type OutputRow = {
   chunkLen?: number;
   hash?: string;
   docid?: string;
+  metadata?: DocumentMetadata;
   explain?: HybridQueryExplain;
 };
 
@@ -2514,6 +2749,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         line: snippetInfo.line,
         title: row.title,
         ...(row.context && { context: row.context }),
+        ...(row.metadata && Object.keys(row.metadata).length > 0 && { metadata: row.metadata }),
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
@@ -2671,6 +2907,10 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
   warnUnresolvedFullPaths(unresolvedCount, filtered.length);
 }
 
+function describeVectorLayout(layout: VectorTableLayout): string {
+  return `${layout.chunks} chunks for ${layout.neededChunks} needed, ${Math.round(layout.occupancy * 100)}% useful`;
+}
+
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
@@ -2790,6 +3030,61 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
+// Parse and validate a --filter JSON string; exits with an actionable
+// message on malformed JSON or an invalid filter AST.
+function parseCliMetadataFilter(rawFilter: unknown): MetadataFilter | undefined {
+  return parseCliPredicateFlag(rawFilter, {
+    flag: "--filter",
+    example: `{"field":"status","operator":"eq","value":"published"}`,
+    parse: parseMetadataFilter,
+  });
+}
+
+// Same grammar as --filter, evaluated against metadata entries for discovery.
+function parseCliMetadataMatch(rawMatch: unknown): MetadataMatch | undefined {
+  return parseCliPredicateFlag(rawMatch, {
+    flag: "--match",
+    example: `{"field":"key","operator":"eq","value":"topics"}`,
+    parse: parseMetadataMatch,
+  });
+}
+
+interface CliPredicateFlag<Predicate> {
+  flag: string;
+  example: string;
+  parse: (input: unknown) => Predicate;
+}
+
+// Parse a JSON predicate flag with the parser for its record type.
+function parseCliPredicateFlag<Predicate>(raw: unknown, predicateFlag: CliPredicateFlag<Predicate>): Predicate | undefined {
+  if (raw === undefined) return undefined;
+
+  let astJson: unknown;
+  try {
+    astJson = JSON.parse(String(raw));
+  } catch (err) {
+    console.error(`Invalid ${predicateFlag.flag} JSON: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`Example: ${predicateFlag.flag} '${predicateFlag.example}'`);
+    process.exit(1);
+  }
+
+  try {
+    return predicateFlag.parse(astJson);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
+// Filtered search and discovery exclude documents without current metadata
+// extraction; tell the user when that makes results incomplete, scoped to
+// the collections the command reads.
+function warnPendingMetadata(db: Database, collectionNames: string[]): void {
+  const pendingMetadata = countDocumentsPendingMetadata(db, collectionNames.length > 0 ? collectionNames : undefined);
+  if (pendingMetadata === 0) return;
+  process.stderr.write(`${c.yellow}Warning: ${pendingMetadata} document(s) lack current metadata extraction and are excluded from filtered results. Run 'qmd update'.${c.reset}\n`);
+}
+
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
@@ -2797,9 +3092,11 @@ function search(query: string, opts: OutputOptions): void {
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
+  if (opts.filter) warnPendingMetadata(db, collectionNames);
+
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
+  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames), opts.filter);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2811,6 +3108,7 @@ function search(query: string, opts: OutputOptions): void {
     context: getContextForFile(db, r.filepath),
     hash: r.hash,
     docid: r.docid,
+    metadata: r.metadata,
   }));
 
   closeDb();
@@ -2845,10 +3143,12 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
   checkIndexHealth(store.db);
+  if (opts.filter) warnPendingMetadata(store.db, collectionNames);
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
+      filter: opts.filter,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2875,6 +3175,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       score: r.score,
       context: r.context,
       docid: r.docid,
+      metadata: r.metadata,
     })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
@@ -2887,6 +3188,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   const collectionNames = resolveCollectionFilter(opts.collection, true);
 
   checkIndexHealth(store.db);
+  if (opts.filter) warnPendingMetadata(store.db, collectionNames);
 
   // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
   const parsed = parseStructuredQuery(query);
@@ -2915,6 +3217,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
       results = await structuredSearch(store, structuredQueries, {
         collections: collectionNames.length > 0 ? collectionNames : undefined,
+        filter: opts.filter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2943,6 +3246,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
         collection: collectionSearchFilter(collectionNames),
+        filter: opts.filter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -3003,6 +3307,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      metadata: r.metadata,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
@@ -3040,6 +3345,17 @@ function parseCLI() {
       json: { type: "boolean" },
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      filter: { type: "string" },  // Metadata filter (JSON AST) for search/vsearch/query/collection metadata
+      // Metadata discovery options (collection metadata)
+      match: { type: "string" },  // Metadata match (JSON AST) over the entries reported
+      "key-limit": { type: "string" },  // keys reported (default 50)
+      "key-offset": { type: "string" },  // keys skipped before the window
+      "all-keys": { type: "boolean" },  // remove the key window
+      "value-limit": { type: "string" },  // values reported per key (default 10)
+      "value-offset": { type: "string" },  // values skipped per key before the window
+      "all-values": { type: "boolean" },  // remove the value window
+      sort: { type: "string" },  // count (default) | value
+      "min-count": { type: "string" },  // drop values held by fewer documents
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -3579,6 +3895,7 @@ function showHelp(): void {
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
+  console.log("  qmd collection metadata [name] [--match J]   - Discover metadata keys and values to filter on");
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
   console.log("");
@@ -3656,6 +3973,8 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
   console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  --filter <json>            - Metadata filter (recursive JSON AST; search/vsearch/query)");
+  console.log("                                e.g. '{\"field\":\"status\",\"operator\":\"eq\",\"value\":\"published\"}'");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
@@ -3923,27 +4242,17 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   }
 }
 
-async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
+export async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
   const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
   if (activeDocs === 0) {
     return { ok: true, details: "no active documents indexed" };
   }
 
-  const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!vecTableExists) {
+  if (!hasVectorIndex(db)) {
     return { ok: false, details: "no vector table to test; please run qmd embed again" };
   }
 
-  const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ?
-    GROUP BY cv.hash, cv.seq, c.doc
-    ORDER BY random()
-    LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+  const samples = getEmbeddingVectorSamples(db, model, fingerprint, sampleSize);
 
   if (samples.length === 0) {
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
@@ -3956,7 +4265,9 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
       const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
-      const chunk = chunks[sample.seq];
+      // Sequence numbers identify stored vectors, but earlier chunks can split
+      // differently after a tokenizer/chunker change. Compare the saved passage.
+      const chunk = chunks.find(chunk => chunk.pos === sample.pos);
       if (!chunk) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
         continue;
@@ -3969,13 +4280,13 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
         continue;
       }
 
-      const stored = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`).get(hashSeq) as { embedding: Uint8Array } | undefined;
+      const stored = storedEmbedding(db, sample.hash, sample.seq);
       if (!stored) {
         mismatches.push(`${shortHashSeq(hashSeq)}: stored vector missing`);
         continue;
       }
 
-      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
+      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored));
       if (distance > threshold) {
         mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
       }
@@ -4569,6 +4880,16 @@ if (isMain) {
             const ctxCount = Object.keys(col.context).length;
             console.log(`  Contexts: ${ctxCount}`);
           }
+          collectionShowMetadata(name);
+          break;
+        }
+
+        case "metadata": {
+          // Positional names are optional; omitted means the default
+          // collections, as an unscoped search does.
+          const rawNames = cli.args.length > 1 ? cli.args.slice(1) : undefined;
+          const collectionNames = resolveCollectionFilter(rawNames, true);
+          collectionMetadata(collectionNames, parseCliMetadataOptions(cli.values));
           break;
         }
 
@@ -4582,6 +4903,13 @@ if (isMain) {
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
+          console.log("  metadata [name...]        Discover metadata keys, types, and value counts");
+          console.log("    --match <json>          Report only metadata entries matching this condition");
+          console.log("                            (same AST as --filter; 'field' is the entry's key or value)");
+          console.log("    --filter <json>         Count only documents matching a metadata filter");
+          console.log("    --key-limit <n>         Keys reported (default 50), --key-offset <n> pages, --all-keys removes the window");
+          console.log("    --value-limit <n>       Values per key (default 10), --value-offset <n> pages, --all-values removes the window");
+          console.log("    --sort count|value      Value order (default count), --min-count <n> drops the tail");
           console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
           console.log("  include <name>            Include in default queries");
           console.log("  exclude <name>            Exclude from default queries");
@@ -4591,6 +4919,9 @@ if (isMain) {
           console.log("  qmd collection add ~/notes --name notes --mask 'a.md,journals/*.md'");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
+          console.log("  qmd collection metadata notes --match '{\"field\":\"key\",\"operator\":\"eq\",\"value\":\"topics\"}'");
+          console.log("  qmd collection metadata notes --match '{\"field\":\"value\",\"operator\":\"eq\",\"value\":\"docs-team\"}'");
+          console.log("  qmd collection metadata notes --match '{\"field\":\"key\",\"operator\":\"eq\",\"value\":\"topics\"}' --filter '{\"field\":\"status\",\"operator\":\"eq\",\"value\":\"published\"}'");
           process.exit(0);
         }
 
@@ -4680,6 +5011,7 @@ if (isMain) {
         console.error("Usage: qmd search [options] <query>");
         process.exit(1);
       }
+      cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
       search(cli.query, cli.opts);
       break;
 
@@ -4693,6 +5025,7 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
+      cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
       await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);
       break;
@@ -4703,6 +5036,7 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
+      cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
       await resolveLocalConfigTrust();
       await querySearch(cli.query, cli.opts);
       break;
@@ -4917,12 +5251,19 @@ if (isMain) {
         if (stats.orphanedContent > 0) {
           console.log(`Would remove ${stats.orphanedContent} orphaned content hashes`);
         }
+        if (stats.vectorLayout) {
+          console.log(stats.vectorsRepacked
+            ? `Would repack the vector table (${describeVectorLayout(stats.vectorLayout)})`
+            : `${c.dim}Vector table is packed (${describeVectorLayout(stats.vectorLayout)})${c.reset}`);
+        }
         console.log("Would compact FTS and vacuum the database");
         closeDb();
         break;
       }
 
-      const stats = runCleanup(db);
+      const stats = runCleanup(db, {
+        onVectorRepack: (layout) => console.log(`Repacking the vector table (${describeVectorLayout(layout)})...`),
+      });
       console.log(`${c.green}✓${c.reset} Cleared ${stats.cacheCount} cached API responses`);
       if (stats.orphanedVectors > 0) {
         console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedVectors} orphaned embedding chunks`);
@@ -4934,6 +5275,11 @@ if (isMain) {
       }
       if (stats.orphanedContent > 0) {
         console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedContent} orphaned content hashes`);
+      }
+      if (stats.vectorLayout) {
+        console.log(stats.vectorsRepacked
+          ? `${c.green}✓${c.reset} Repacked the vector table (${describeVectorLayout(stats.vectorLayout)})`
+          : `${c.dim}Vector table is packed (${describeVectorLayout(stats.vectorLayout)})${c.reset}`);
       }
       console.log(`${c.green}✓${c.reset} FTS compacted, database vacuumed`);
 
